@@ -29,9 +29,8 @@ from zengine.lib.camunda_parser import ZopsSerializer
 from zengine.lib.exceptions import HTTPError
 from zengine.lib import translation
 from zengine.log import log
-
-# crud_view = CrudView()
 from zengine.models import BPMNWorkflow
+from zengine.models.workflow_manager import TaskInvitation, WFCache
 
 
 class ZEngine(object):
@@ -223,6 +222,13 @@ class ZEngine(object):
                 self.wf_state['finished'] = True
                 self.wf_state['finish_date'] = datetime.now().strftime(
                     settings.DATETIME_DEFAULT_FORMAT)
+
+                if self.current.workflow_name not in settings.EPHEMERAL_WORKFLOWS and not \
+                self.wf_state['in_external']:
+                    wfi = WFCache(self.current).get_instance()
+                    TaskInvitation.objects.filter(instance=wfi, role=self.current.role,
+                                              wf_name=wfi.wf.name).delete()
+
                 self.current.log.info("Delete WFCache: %s %s" % (self.current.workflow_name,
                                                                  self.current.token))
             self.save_workflow_to_cache(self.serialize_workflow())
@@ -251,6 +257,13 @@ class ZEngine(object):
         self.check_for_authentication()
         self.check_for_permission()
         self.workflow = self.load_or_create_workflow()
+
+        # if form data exists in input (user submitted)
+        # put form data in wf task_data
+        if 'form' in self.current.input:
+            form = self.current.input['form']
+            if 'form_name' in form:
+                self.current.task_data[form['form_name']] = form
 
         # in wf diagram, if property is stated as init = True
         # demanded initial values are assigned and put to cache
@@ -366,7 +379,10 @@ class ZEngine(object):
             main_wf = self.wf_state.copy()
 
             # workflow name from main wf diagram is assigned to current workflow name.
-            self.current.workflow_name = self.current.task.task_spec.topic
+            # workflow name must be either in task_data with key 'external_wf' or in main diagram's
+            # topic.
+            self.current.workflow_name = self.current.task_data.pop('external_wf', False) or self.\
+                current.task.task_spec.topic
 
             # For external WF, check permission and authentication. But after cleaning current task.
             self._clear_current_task()
@@ -427,6 +443,7 @@ class ZEngine(object):
         is_lane_changed = False
 
         while self._should_we_run():
+            self.check_for_rerun_user_task()
             task = None
             for task in self.workflow.get_tasks(state=Task.READY):
                 self.current.old_lane = self.current.lane_name
@@ -453,6 +470,35 @@ class ZEngine(object):
             self.current._update_task(task)
             self.catch_lane_change()
             self.handle_wf_finalization()
+
+    def check_for_rerun_user_task(self):
+        """
+        Checks that the user task needs to re-run.
+        If necessary, current task and pre task's states are changed and re-run.
+        If wf_meta not in data(there is no user interaction from pre-task) and last completed task
+        type is user task and current step is not EndEvent and there is no lane change,
+        this user task is rerun.
+        """
+        data = self.current.input
+        if 'wf_meta' in data:
+            return
+
+        current_task = self.workflow.get_tasks(Task.READY)[0]
+        current_task_type = current_task.task_spec.__class__.__name__
+        pre_task = current_task.parent
+        pre_task_type = pre_task.task_spec.__class__.__name__
+
+        if pre_task_type != 'UserTask':
+            return
+
+        if current_task_type == 'EndEvent':
+            return
+
+        pre_lane = pre_task.task_spec.lane
+        current_lane = current_task.task_spec.lane
+        if pre_lane == current_lane:
+            pre_task._set_state(Task.READY)
+            current_task._set_state(Task.MAYBE)
 
     def switch_lang(self):
         """Switch to the language of the current user.

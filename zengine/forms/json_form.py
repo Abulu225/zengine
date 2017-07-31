@@ -16,14 +16,15 @@ three main goals:
 # This file is licensed under the GNU General Public License v3
 # (GPLv3).  See LICENSE.txt for details.
 from uuid import uuid4
-
 import six
-
+from pyoko.model import Model
 from pyoko.fields import BaseField
 from zengine.forms.fields import Button
 from zengine.lib.cache import Cache
 from zengine.lib.exceptions import FormValidationError
 from .model_form import ModelForm
+from datetime import datetime
+
 
 class FormCache(Cache):
     """
@@ -40,6 +41,7 @@ class FormCache(Cache):
             form_id = uuid4().hex
         self.form_id = form_id
         super(FormCache, self).__init__(form_id)
+
 
 class JsonForm(ModelForm):
     """
@@ -90,8 +92,25 @@ class JsonForm(ModelForm):
         self.process_form()
 
     def get_links(self, **kw):
-        """ Fake method to emulate pyoko model API. """
-        return []
+        """
+        Prepare links of form by mimicing pyoko's get_links method's result
+
+        Args:
+            **kw:
+
+        Returns: list of link dicts
+
+        """
+
+        links = [a for a in dir(self) if isinstance(getattr(self, a), Model)
+                 and not a.startswith('_model')]
+
+        return [
+            {
+                'field': l,
+                'mdl': getattr(self, l).__class__,
+            } for l in links
+        ]
 
     def _get_bucket_name(self):
         """ Fake method to emulate pyoko model API. """
@@ -229,6 +248,12 @@ class JsonForm(ModelForm):
             result["model"]['model_type'] = self._model.__class__.__name__
             result["model"]['unicode'] = six.text_type(self._model)
 
+        # if form intentionally marked as fillable from task data by assigning False to always_blank
+        # field in Meta class, form_data is retrieved from task_data if exist in else None
+        form_data = None
+        if not self.Meta.always_blank:
+            form_data = self.context.task_data.get(self.__class__.__name__, None)
+
         for itm in self._serialize():
             item_props = {'type': itm['type'], 'title': itm['title']}
 
@@ -238,10 +263,26 @@ class JsonForm(ModelForm):
             if 'kwargs' in itm and 'widget' in itm['kwargs']:
                 item_props['widget'] = itm['kwargs'].pop('widget')
 
-            # if value is None and default value is not None returns default value
-            # if value is not None returns value
-            # if both are None returns value as None
-            result["model"][itm['name']] = itm['default'] if itm['value'] is None and itm['default'] is not None else itm['value']
+            if form_data:
+                if form_data[itm['name']] and (itm['type'] == 'date' or itm['type'] == 'datetime'):
+                    value_to_serialize = datetime.strptime(
+                        form_data[itm['name']], itm['format'])
+                else:
+                    value_to_serialize = form_data[itm['name']]
+                value = self._serialize_value(value_to_serialize)
+                if itm['type'] == 'button':
+                    value = None
+            # if form_data is empty, value will be None, so it is needed to fill the form from model
+            # or leave empty
+            else:
+                # if itm['value'] is not None returns itm['value']
+                # else itm['default']
+                if itm['value'] is not None:
+                    value = itm['value']
+                else:
+                    value = itm['default']
+
+            result["model"][itm['name']] = value
 
             if itm['type'] == 'model':
                 item_props['model_name'] = itm['model_name']
@@ -257,6 +298,9 @@ class JsonForm(ModelForm):
                 self._handle_choices(itm, item_props, result)
             else:
                 result["form"].append(itm['name'])
+
+            if 'help_text' in itm:
+                item_props['help_text'] = itm['help_text']
 
             if 'schema' in itm:
                 item_props['schema'] = itm['schema']
@@ -312,6 +356,7 @@ class JsonForm(ModelForm):
         """
         cache = FormCache()
         form['model']['form_key'] = cache.form_id
+        form['model']['form_name'] = self.__class__.__name__
         cache.set(
             {
                 'model': list(form['model'].keys()),  # In Python 3, dictionary keys are not serializable

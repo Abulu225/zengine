@@ -481,10 +481,11 @@ class LoadDiagrams(Command, BaseThreadedCommand):
             paths = self.get_wf_from_path(self.manager.args.wf_path)
         else:
             paths = self.get_workflows()
-
+            
         self.counter = AtomicCounter()
-
+        
         self.do_with_submit(self.load_diagram, paths, threads=self.manager.args.threads)
+        
         WFSpecNames().refresh()
 
         print("%s BPMN file loaded" % self.counter.value)
